@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Thermod monitor to forward temperature and current status to Home Assistant
+
+@author:     Simone Rossetto
+@copyright:  2020 Simone Rossetto
+@license:    GNU General Public License v3
+@contact:    simros85@gmail.com
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""
+
+import os
+import sys
+import signal
+import argparse
+import requests
+import time
+import logging
+import configparser
+
+from thermod import ThermodStatus
+from thermod.common import LogStyleAdapter, LOGGER_BASE_NAME, LOGGER_FMT_MSG, \
+    LOGGER_FMT_TIME, LOGGER_FMT_STYLE, LOGGER_FMT_MSG_SYSLOG, LOGGER_FMT_DATETIME, \
+    RET_CODE_OK, RET_CODE_CFG_FILE_UNKNOWN_ERR, RET_CODE_CFG_FILE_INVALID, \
+    RET_CODE_CFG_FILE_MISSING, RET_CODE_RUN_OTHER_ERR
+from logging.handlers import SysLogHandler
+
+__version__ = '0.0.0.dev1'
+__date__ = '2020-05-29'
+__updated__ = '2020-05-29'
+
+__monitor_name__ = 'homeassistant'
+
+# setting up logging system
+logger = LogStyleAdapter(logging.getLogger('{}.{}'.format(LOGGER_BASE_NAME, __monitor_name__)))
+logger.setLevel(logging.INFO)
+
+# config filename and search paths (the last found overwrites the previouses)
+MAIN_CONFIG_FILENAME = 'monitor-homeassistant.conf'
+MAIN_CONFIG_DEFAULT_FILE = os.path.join(os.path.expanduser('~/.thermod'), MAIN_CONFIG_FILENAME)
+MAIN_CONFIG_FILES = [os.path.join('/etc/thermod', MAIN_CONFIG_FILENAME),
+                     os.path.join('/var/lib/thermod', MAIN_CONFIG_FILENAME),
+                     os.path.join('/usr/local/etc/thermod', MAIN_CONFIG_FILENAME),
+                     os.path.join(os.path.expanduser('~/.config/thermod'), MAIN_CONFIG_FILENAME),
+                     MAIN_CONFIG_DEFAULT_FILE]
+
+# sleep time in case of network error (seconds)
+SLEEP_TIME = 10
+
+# shutdown check and return code
+running = True
+main_return_code = RET_CODE_OK
+
+def shutdown(signum=None, frame=None, exitcode=0):
+    global running, main_return_code
+    logger.info('shutdown requested')
+    running = False
+    main_return_code = exitcode
+
+signal.signal(signal.SIGTERM, shutdown)
+
+# parse input arguments
+parser = argparse.ArgumentParser(description='Thermod monitor for Home Assistant: read data from Thermod and send it to Home Assistant.')
+parser.add_argument('-c', '--config', action='store', default=None, help='path to configuration file')
+parser.add_argument('-L', '--log', action='store', default=None, help='write log messages to LOG file (full path)')
+parser.add_argument('-D', '--debug', action='store_true', help='start the monitor in debug mode')
+parser.add_argument('--syslog', action='store_true', help='log messages to syslog (useful if started by systemd)')
+parser.add_argument('-v', '--version', action='version', version='%(prog)s {}'.format(__version__))
+args = parser.parse_args()
+
+# set logger
+if args.debug:
+    logger.setLevel(logging.DEBUG)
+
+if args.syslog:
+    syslog = SysLogHandler(address='/dev/log', facility=SysLogHandler.LOG_DAEMON)
+    syslog.setFormatter(logging.Formatter(fmt=LOGGER_FMT_MSG_SYSLOG,
+                                          style=LOGGER_FMT_STYLE))
+    logger.addHandler(syslog)
+else:
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(logging.Formatter(fmt=LOGGER_FMT_MSG,
+                                           datefmt=LOGGER_FMT_TIME,
+                                           style=LOGGER_FMT_STYLE))
+    logger.addHandler(console)
+
+if args.log:
+    try:
+        logfile = logging.FileHandler(args.log, mode='a')
+    
+    except PermissionError as pe:
+        logger.warning('cannot write log to `{}`: {}', args.log, pe)
+        logger.info('the monitor will start without logfile')
+    
+    else:
+        logfile.setFormatter(logging.Formatter(fmt=LOGGER_FMT_MSG,
+                                               datefmt=LOGGER_FMT_DATETIME,
+                                               style=LOGGER_FMT_STYLE))
+        logger.addHandler(logfile)
+    
+        if args.syslog:
+            # When a custom log file is configured and the deamon in started
+            # in background, only warnings and errors are printed to syslog.
+            syslog.setLevel(logging.WARNING)
+        
+        logger.debug('logging to file {}', args.log)
+
+# read config file
+config_files = args.config if args.config else MAIN_CONFIG_FILES
+
+try:
+    cfg_err = RET_CODE_OK
+    cfg = configparser.ConfigParser()
+    
+    logger.debug('searching configuration in files {}', config_files)
+    _cfg_files_found = cfg.read(config_files)
+    
+    if _cfg_files_found:
+        logger.debug('configuration files found: {}', _cfg_files_found)
+        
+    else:
+        raise FileNotFoundError()
+    
+    device_name = cfg.get('monitor/homeassistant', 'device_name')
+    friendly_name = cfg.get('monitor/homeassistant', 'friendly_name')
+    unit_of_measurement = cfg.get('monitor/homeassistant', 'unit_of_measurement')
+    logger.debug('config sensor: name={}, friendly={}, unit={}', device_name, friendly_name, unit_of_measurement)
+    
+    hassio_url = cfg.get('monitor/homeassistant', 'url').rstrip('/')
+    access_token = cfg.get('monitor/homeassistant', 'access_token')
+    logger.debug('config Home Assistant url: {}', hassio_url)
+    
+    thermod_url = cfg.get('monitor/homeassistant', 'thermod_url').rstrip('/')
+    logger.debug('config Thermod url: {}', thermod_url)
+
+except ValueError as ve:
+    logger.error('invalid value in configuration file: {}', ve)
+    cfe_error = RET_CODE_CFG_FILE_INVALID
+
+except FileNotFoundError as fnfe:
+    logger.error('no configuration file found, cannot continue')
+    cfe_error = RET_CODE_CFG_FILE_MISSING
+
+except configparser.Error as cpe:
+    logger.error('error in configuration file: {}', cpe)
+    cfg_err = RET_CODE_CFG_FILE_INVALID
+
+except Exception as e:
+    logger.critical('unknown error in configuration file: {}', e, exc_info=True)
+    cfg_err = RET_CODE_CFG_FILE_UNKNOWN_ERR
+
+finally:
+    if cfg_err != RET_CODE_OK:
+        logger.info('closing monitor with return code {}', cfg_err)
+        exit(cfg_err)
+
+# main
+with requests.Session() as thermod, requests.Session() as hassio:
+    try:
+        logger.info('Thermod monitor for Home Assistant v{} started', __version__)
+        
+        # set access token for Home Assistant
+        logger.debug('setting access token for Home Assistant')
+        hassio.headers.update({'authorization': 'Bearer {}'.format(access_token)})
+        
+        while running:
+            _error = False
+            try:
+                logger.debug('longpolling Thermod status')
+                t_resp = thermod.get('{}/monitor?name={}'.format(thermod_url, __monitor_name__))
+                t_resp.raise_for_status()
+                
+                logger.debug('processing data returned from Thermod')
+                t_jrsp = t_resp.json()
+                t_status = ThermodStatus(**t_jrsp)
+            
+            except (KeyError, ValueError) as ve:
+                logger.error('invalid data returned from Thermod: {}', ve)
+                _error = True
+            
+            except requests.exceptions.RequestException as re:
+                logger.error('error reading Thermod data: {}', re)
+                _error = True
+            
+            else:
+                payload = {'state': t_status.current_temperature,
+                           'attributes': {'unit_of_measurement': unit_of_measurement,
+                                          'friendly_name': friendly_name}}
+                
+                try:
+                    logger.debug('updating Home Assistant: sensor={}, state={}', device_name, payload['state'])
+                    h_resp = hassio.post('{}/api/states/sensor.{}'.format(hassio_url, device_name), json=payload)
+                    h_resp.raise_for_status()
+                
+                except requests.exceptions.RequestException as re:
+                    logger.error('cannot update Home Assistant: {}', re)
+                    _error = True
+            
+            if _error:
+                logger.debug('sleeping for {} seconds', SLEEP_TIME)
+                time.sleep(SLEEP_TIME)
+    
+    except Exception as e:
+        logger.critical('unknown error: {}', e)
+        main_return_code = RET_CODE_RUN_OTHER_ERR
+    
+    except KeyboardInterrupt:
+        logger.debug('shutdown requested by keyboard interrupt')
+        shutdown()
+
+logger.info('closing monitor with return code {}', main_return_code)
+exit(main_return_code)
+
+# vim: fileencoding=utf-8 syntax=python 
