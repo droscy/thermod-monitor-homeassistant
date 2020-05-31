@@ -57,9 +57,6 @@ MAIN_CONFIG_FILES = [os.path.join('/etc/thermod', MAIN_CONFIG_FILENAME),
                      os.path.join(os.path.expanduser('~/.config/thermod'), MAIN_CONFIG_FILENAME),
                      MAIN_CONFIG_DEFAULT_FILE]
 
-# sleep time in case of network error (seconds)
-SLEEP_TIME = 10
-
 # shutdown check and return code
 running = True
 main_return_code = RET_CODE_OK
@@ -146,6 +143,9 @@ try:
     thermod_url = cfg.get('monitor/homeassistant', 'thermod_url').rstrip('/')
     logger.debug('config Thermod url: {}', thermod_url)
 
+    sleep_time = cfg.getint('monitor/homeassistant', 'sleep_time', fallback=30)
+    logger.debug('config sleep time for errors: {}', sleep_time)
+
 except ValueError as ve:
     logger.error('invalid value in configuration file: {}', ve)
     cfe_error = RET_CODE_CFG_FILE_INVALID
@@ -230,8 +230,8 @@ with requests.Session() as thermod, requests.Session() as hassio:
                     _error = True
             
             if _error:
-                logger.debug('sleeping for {} seconds', SLEEP_TIME)
-                time.sleep(SLEEP_TIME)
+                logger.debug('sleeping for {} seconds', sleep_time)
+                time.sleep(sleep_time)
     
     except Exception as e:
         logger.critical('unknown error: {}', e)
@@ -244,4 +244,4 @@ with requests.Session() as thermod, requests.Session() as hassio:
 logger.info('closing monitor with return code {}', main_return_code)
 exit(main_return_code)
 
-# vim: fileencoding=utf-8 syntax=python 
+# vim: fileencoding=utf-8 syntax=python tabstop=4 shiftwidth=4 expandtab
