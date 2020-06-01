@@ -38,9 +38,9 @@ from thermod.common import LogStyleAdapter, LOGGER_BASE_NAME, LOGGER_FMT_MSG, \
     RET_CODE_CFG_FILE_MISSING, RET_CODE_RUN_OTHER_ERR
 from logging.handlers import SysLogHandler
 
-__version__ = '0.0.0.dev2'
+__version__ = '0.0.0.dev3'
 __date__ = '2020-05-29'
-__updated__ = '2020-05-31'
+__updated__ = '2020-06-01'
 
 __monitor_name__ = 'homeassistant'
 
@@ -130,21 +130,21 @@ try:
         
     else:
         raise FileNotFoundError()
-    
-    device_name = cfg.get('monitor/homeassistant', 'device_name')
-    friendly_name = cfg.get('monitor/homeassistant', 'friendly_name')
-    unit_of_measurement = cfg.get('monitor/homeassistant', 'unit_of_measurement')
-    logger.debug('config sensor: name={}, friendly={}, unit={}', device_name, friendly_name, unit_of_measurement)
-    
-    hassio_url = cfg.get('monitor/homeassistant', 'url').rstrip('/')
-    access_token = cfg.get('monitor/homeassistant', 'access_token')
-    logger.debug('config Home Assistant url: {}', hassio_url)
-    
-    thermod_url = cfg.get('monitor/homeassistant', 'thermod_url').rstrip('/')
-    logger.debug('config Thermod url: {}', thermod_url)
 
-    sleep_time = cfg.getint('monitor/homeassistant', 'sleep_time', fallback=30)
-    logger.debug('config sleep time for errors: {}', sleep_time)
+    DEVICE_NAME = cfg.get('monitor/homeassistant', 'device_name')
+    FRIENDLY_NAME = cfg.get('monitor/homeassistant', 'friendly_name')
+    UNIT_OF_MEASUREMENT = cfg.get('monitor/homeassistant', 'unit_of_measurement')
+    logger.debug('config sensor: name={}, friendly={}, unit={}', DEVICE_NAME, FRIENDLY_NAME, UNIT_OF_MEASUREMENT)
+
+    HASSIO_URL = cfg.get('monitor/homeassistant', 'url').rstrip('/')
+    ACCESS_TOKEN = cfg.get('monitor/homeassistant', 'access_token')
+    logger.debug('config Home Assistant url: {}', HASSIO_URL)
+
+    THERMOD_URL = cfg.get('monitor/homeassistant', 'thermod_url').rstrip('/')
+    logger.debug('config Thermod url: {}', THERMOD_URL)
+
+    SLEEP_TIME = cfg.getint('monitor/homeassistant', 'sleep_time', fallback=30)
+    logger.debug('config sleep time for errors: {}', SLEEP_TIME)
 
 except ValueError as ve:
     logger.error('invalid value in configuration file: {}', ve)
@@ -167,6 +167,31 @@ finally:
         logger.info('closing monitor with return code {}', cfg_err)
         exit(cfg_err)
 
+# function to update Home Assistant sensors
+def update_home_assistant_sensor(session, device_name, friendly_name, state, binary, unit_of_measurement=None):
+    try:
+        logger.debug('updating Home Assistant: {}sensor={}, state={}',
+                     'binary_' if binary else '',
+                     device_name,
+                     state)
+        
+        payload = {'state': state,
+                   'attributes': {'friendly_name': friendly_name}}
+        
+        if unit_of_measurement:
+            payload['attributes']['unit_of_measurement'] = unit_of_measurement
+        
+        url = '{}/api/states/{}.{}'.format(HASSIO_URL, 'binary_sensor' if binary else 'sensor', device_name)
+        h_resp = hassio.post(url, json=payload)
+        h_resp.raise_for_status()
+    
+    except requests.exceptions.RequestException as re:
+        logger.error('cannot update Home Assistant for {}sensor {}: {}',
+                     'binary ' if binary else '',
+                     device_name,
+                     re)
+        raise
+
 # main
 with requests.Session() as thermod, requests.Session() as hassio:
     try:
@@ -174,13 +199,13 @@ with requests.Session() as thermod, requests.Session() as hassio:
         
         # set access token for Home Assistant
         logger.debug('setting access token for Home Assistant')
-        hassio.headers.update({'authorization': 'Bearer {}'.format(access_token)})
+        hassio.headers.update({'authorization': 'Bearer {}'.format(ACCESS_TOKEN)})
         
         while running:
             _error = False
             try:
                 logger.debug('longpolling Thermod status')
-                t_resp = thermod.get('{}/monitor?name={}'.format(thermod_url, __monitor_name__))
+                t_resp = thermod.get('{}/monitor?name={}'.format(THERMOD_URL, __monitor_name__))
                 t_resp.raise_for_status()
                 
                 logger.debug('processing data returned from Thermod')
@@ -196,37 +221,46 @@ with requests.Session() as thermod, requests.Session() as hassio:
                 _error = True
             
             else:
-                # update temperature
                 try:
-                    _device_name = 'sensor.{}_temperature'.format(device_name)
-                    _friendly_name = '{} temperature'.format(friendly_name)
+                    # update temperature
+                    update_home_assistant_sensor(hassio,
+                                                 '{}_temperature'.format(DEVICE_NAME),
+                                                 '{} temperature'.format(FRIENDLY_NAME),
+                                                 t_status.current_temperature,
+                                                 False,
+                                                 UNIT_OF_MEASUREMENT)
                     
-                    payload = {'state': t_status.current_temperature,
-                               'attributes': {'unit_of_measurement': unit_of_measurement,
-                                              'friendly_name': _friendly_name}}
-                
-                    logger.debug('updating Home Assistant: sensor={}, state={}', _device_name, payload['state'])
-                    h_resp = hassio.post('{}/api/states/{}'.format(hassio_url, _device_name), json=payload)
-                    h_resp.raise_for_status()
-                
-                except requests.exceptions.RequestException as re:
-                    logger.error('cannot update Home Assistant for sensor {}: {}', _device_name, re)
-                    _error = True
-                
-                # update status
-                try:
-                    _device_name = 'binary_sensor.{}_status'.format(device_name)
-                    _friendly_name = '{} status'.format(friendly_name)
+                    # update status
+                    update_home_assistant_sensor(hassio,
+                                                 '{}_status'.format(DEVICE_NAME),
+                                                 '{} current status'.format(FRIENDLY_NAME),
+                                                 'on' if t_status.heating_status==1 else 'off',
+                                                 True)
                     
-                    payload = {'state': 'on' if t_status.heating_status==1 else 'off',
-                               'attributes': {'friendly_name': _friendly_name}}
+                    # update current mode
+                    if t_status.status in ('on', 'off', 'auto'):
+                        _mode = t_status.status[0].upper() + t_status.status[1:]
+                    elif t_status.status in ('tmin', 'tmax'):
+                        _mode = 't_{}'.format(t_status.status[1:])
+                    elif t_status.status == 't0':
+                        _mode = 'Antifreeze'
+                    else:
+                        _mode = t_status.status
+                    
+                    update_home_assistant_sensor(hassio,
+                                                 '{}_mode'.format(DEVICE_NAME),
+                                                 '{} current mode'.format(FRIENDLY_NAME),
+                                                 _mode,
+                                                 False)
+                    
+                    # update heating/cooling
+                    update_home_assistant_sensor(hassio,
+                                                 '{}_device'.format(DEVICE_NAME),
+                                                 '{} device'.format(FRIENDLY_NAME),
+                                                 'Cooling' if t_status.cooling else 'Heating',
+                                                 False)
                 
-                    logger.debug('updating Home Assistant: sensor={}, state={}', _device_name, payload['state'])
-                    h_resp = hassio.post('{}/api/states/{}'.format(hassio_url, _device_name), json=payload)
-                    h_resp.raise_for_status()
-                
-                except requests.exceptions.RequestException as re:
-                    logger.error('cannot update Home Assistant for sensor {}: {}', _device_name, re)
+                except requests.exceptions.RequestException:
                     _error = True
             
             if _error:
