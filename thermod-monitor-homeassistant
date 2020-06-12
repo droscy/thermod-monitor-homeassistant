@@ -38,9 +38,9 @@ from thermod.common import LogStyleAdapter, LOGGER_BASE_NAME, LOGGER_FMT_MSG, \
     RET_CODE_CFG_FILE_MISSING, RET_CODE_RUN_OTHER_ERR
 from logging.handlers import SysLogHandler
 
-__version__ = '0.0.0.dev3'
+__version__ = '0.0.0.dev5'
 __date__ = '2020-05-29'
-__updated__ = '2020-06-01'
+__updated__ = '2020-06-12'
 
 __monitor_name__ = 'homeassistant'
 
@@ -201,6 +201,9 @@ with requests.Session() as thermod, requests.Session() as hassio:
         logger.debug('setting access token for Home Assistant')
         hassio.headers.update({'authorization': 'Bearer {}'.format(ACCESS_TOKEN)})
         
+        # create old status
+        t_old_status = ThermodStatus(0)
+        
         while running:
             _error = False
             try:
@@ -221,51 +224,58 @@ with requests.Session() as thermod, requests.Session() as hassio:
                 _error = True
             
             else:
-                try:
-                    # update temperature
-                    update_home_assistant_sensor(hassio,
-                                                 '{}_temperature'.format(DEVICE_NAME),
-                                                 '{} temperature'.format(FRIENDLY_NAME),
-                                                 t_status.current_temperature,
-                                                 False,
-                                                 UNIT_OF_MEASUREMENT)
+                if t_old_status[1:] != t_status[1:]:
+                    try:
+                        # update temperature
+                        update_home_assistant_sensor(hassio,
+                                                     '{}_temperature'.format(DEVICE_NAME),
+                                                     '{} temperature'.format(FRIENDLY_NAME),
+                                                     t_status.current_temperature,
+                                                     False,
+                                                     UNIT_OF_MEASUREMENT)
+                        
+                        # update status
+                        update_home_assistant_sensor(hassio,
+                                                     '{}_status'.format(DEVICE_NAME),
+                                                     '{} current status'.format(FRIENDLY_NAME),
+                                                     'on' if t_status.heating_status==1 else 'off',
+                                                     True)
+                        
+                        # update current mode
+                        if t_status.status in ('on', 'off', 'auto'):
+                            _mode = t_status.status[0].upper() + t_status.status[1:]
+                        elif t_status.status in ('tmin', 'tmax'):
+                            _mode = 't_{}'.format(t_status.status[1:])
+                        elif t_status.status == 't0':
+                            _mode = 'Antifreeze'
+                        else:
+                            _mode = t_status.status
+                        
+                        update_home_assistant_sensor(hassio,
+                                                     '{}_mode'.format(DEVICE_NAME),
+                                                     '{} current mode'.format(FRIENDLY_NAME),
+                                                     _mode,
+                                                     False)
+                        
+                        # update heating/cooling
+                        update_home_assistant_sensor(hassio,
+                                                     '{}_device'.format(DEVICE_NAME),
+                                                     '{} device'.format(FRIENDLY_NAME),
+                                                     'Cooling' if t_status.cooling else 'Heating',
+                                                     False)
+                        
+                        # save old status
+                        t_old_status = t_status
                     
-                    # update status
-                    update_home_assistant_sensor(hassio,
-                                                 '{}_status'.format(DEVICE_NAME),
-                                                 '{} current status'.format(FRIENDLY_NAME),
-                                                 'on' if t_status.heating_status==1 else 'off',
-                                                 True)
-                    
-                    # update current mode
-                    if t_status.status in ('on', 'off', 'auto'):
-                        _mode = t_status.status[0].upper() + t_status.status[1:]
-                    elif t_status.status in ('tmin', 'tmax'):
-                        _mode = 't_{}'.format(t_status.status[1:])
-                    elif t_status.status == 't0':
-                        _mode = 'Antifreeze'
-                    else:
-                        _mode = t_status.status
-                    
-                    update_home_assistant_sensor(hassio,
-                                                 '{}_mode'.format(DEVICE_NAME),
-                                                 '{} current mode'.format(FRIENDLY_NAME),
-                                                 _mode,
-                                                 False)
-                    
-                    # update heating/cooling
-                    update_home_assistant_sensor(hassio,
-                                                 '{}_device'.format(DEVICE_NAME),
-                                                 '{} device'.format(FRIENDLY_NAME),
-                                                 'Cooling' if t_status.cooling else 'Heating',
-                                                 False)
+                    except requests.exceptions.RequestException:
+                        _error = True
                 
-                except requests.exceptions.RequestException:
-                    _error = True
+                else:
+                    logger.debug('old status and current status are equal, no need to update Home Assistant')
             
             if _error:
-                logger.debug('sleeping for {} seconds', sleep_time)
-                time.sleep(sleep_time)
+                logger.debug('sleeping for {} seconds', SLEEP_TIME)
+                time.sleep(SLEEP_TIME)
     
     except Exception as e:
         logger.critical('unknown error: {}', e)
