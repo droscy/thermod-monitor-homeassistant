@@ -38,9 +38,9 @@ from thermod.common import LogStyleAdapter, LOGGER_BASE_NAME, LOGGER_FMT_MSG, \
     RET_CODE_CFG_FILE_MISSING, RET_CODE_RUN_OTHER_ERR
 from logging.handlers import SysLogHandler
 
-__version__ = '0.0.0.dev5'
+__version__ = '0.0.0.dev6'
 __date__ = '2020-05-29'
-__updated__ = '2020-06-12'
+__updated__ = '2020-06-29'
 
 __monitor_name__ = 'homeassistant'
 
@@ -144,7 +144,10 @@ try:
     logger.debug('config Thermod url: {}', THERMOD_URL)
 
     SLEEP_TIME = cfg.getint('monitor/homeassistant', 'sleep_time', fallback=30)
-    logger.debug('config sleep time for errors: {}', SLEEP_TIME)
+    logger.debug('config sleep time for errors: {} seconds', SLEEP_TIME)
+
+    FORCE_UPDATE_TIME = cfg.getint('monitor/homeassistant', 'force_update_time', fallback=30)
+    logger.debug('config force update time: {} minutes', FORCE_UPDATE_TIME)
 
 except ValueError as ve:
     logger.error('invalid value in configuration file: {}', ve)
@@ -182,7 +185,7 @@ def update_home_assistant_sensor(session, device_name, friendly_name, state, bin
             payload['attributes']['unit_of_measurement'] = unit_of_measurement
         
         url = '{}/api/states/{}.{}'.format(HASSIO_URL, 'binary_sensor' if binary else 'sensor', device_name)
-        h_resp = hassio.post(url, json=payload)
+        h_resp = hassio.post(url, json=payload, timeout=10)
         h_resp.raise_for_status()
     
     except requests.exceptions.RequestException as re:
@@ -204,11 +207,15 @@ with requests.Session() as thermod, requests.Session() as hassio:
         # create old status
         t_old_status = ThermodStatus(0)
         
+        # set first update time (never, epoch)
+        last_update = 0
+        
         while running:
             _error = False
             try:
                 logger.debug('longpolling Thermod status')
-                t_resp = thermod.get('{}/monitor?name={}'.format(THERMOD_URL, __monitor_name__))
+                t_resp = thermod.get('{}/monitor?name={}'.format(THERMOD_URL, __monitor_name__),
+                                     timeout=(10, 600))
                 t_resp.raise_for_status()
                 
                 logger.debug('processing data returned from Thermod')
@@ -219,12 +226,31 @@ with requests.Session() as thermod, requests.Session() as hassio:
                 logger.error('invalid data returned from Thermod: {}', ve)
                 _error = True
             
+            except requests.exceptions.Timeout as to:
+                logger.error('no response frome Thermod in 10 minutes, probably it si down or unreachable')
+                _error = True
+            
             except requests.exceptions.RequestException as re:
                 logger.error('error reading Thermod data: {}', re)
                 _error = True
             
             else:
+                _update = False
                 if t_old_status[1:] != t_status[1:]:
+                    _update = True
+                    logger.debug('update Home Assistant due Thermod state change')
+                
+                elif (time.time() - last_update) >= FORCE_UPDATE_TIME * 60:
+                    _update = True
+                    logger.debug('update Home Assistant due to timeout')
+                
+                else:
+                    logger.debug('old status and current status are equal, no need to update Home Assistant')
+                
+                if _update:
+                    # save last time update
+                    last_update = time.time()
+                    
                     try:
                         # update temperature
                         update_home_assistant_sensor(hassio,
@@ -269,9 +295,6 @@ with requests.Session() as thermod, requests.Session() as hassio:
                     
                     except requests.exceptions.RequestException:
                         _error = True
-                
-                else:
-                    logger.debug('old status and current status are equal, no need to update Home Assistant')
             
             if _error:
                 logger.debug('sleeping for {} seconds', SLEEP_TIME)
