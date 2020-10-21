@@ -1,0 +1,12 @@
+.project
+.pydevproject
+.settings
+__pycache__
+*.pyc
+*.egg-info
+dist/
+build/
+MANIFEST
+venv/
+*.htm*
+.python-version
